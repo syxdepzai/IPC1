@@ -83,22 +83,26 @@ const char *go_forward() {
 // Xử lý tín hiệu để dọn dẹp
 void signal_handler(int sig) {
     printf("Tab %d received signal %d, cleaning up...\n", tab_id, sig);
-    endwin();
     
-    // Ngắt kết nối shared memory
-    if (shm_pointer != NULL) {
-        shmdt(shm_pointer);
+    // Chỉ thoát nếu là SIGTERM hoặc SIGINT
+    if (sig == SIGTERM || sig == SIGINT) {
+        endwin();
+        
+        // Ngắt kết nối shared memory
+        if (shm_pointer != NULL && shm_pointer != (void *)-1) {
+            shmdt(shm_pointer);
+        }
+        
+        // Hủy legacy FIFO
+        unlink(response_fifo);
+        
+        // Hủy message queue của tab
+        if (tab_queue_id >= 0) {
+            destroy_message_queue(tab_queue_id);
+        }
+        
+        exit(0);
     }
-    
-    // Hủy legacy FIFO
-    unlink(response_fifo);
-    
-    // Hủy message queue của tab
-    if (tab_queue_id >= 0) {
-        destroy_message_queue(tab_queue_id);
-    }
-    
-    exit(0);
 }
 
 // Hiển thị nội dung trên giao diện
@@ -261,24 +265,38 @@ int main(int argc, char *argv[]) {
     // Đăng ký handler xử lý tín hiệu
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-
+    signal(SIGSEGV, signal_handler);  // Xử lý lỗi segment fault
+    
     tab_id = atoi(argv[1]);
     snprintf(response_fifo, sizeof(response_fifo), "%s%d", RESPONSE_FIFO_PREFIX, tab_id);
     mkfifo(response_fifo, 0666);
 
     // Kết nối vào browser (FIFO legacy)
-    write_fd = open(BROWSER_FIFO, O_WRONLY);
+    write_fd = open(BROWSER_FIFO, O_WRONLY | O_NONBLOCK);
     if (write_fd < 0) {
         perror("open browser fifo");
-        // Không thoát, sẽ thử message queue
+        printf("Chờ kết nối tới browser...\n");
+        
+        // Thử lại vài lần trước khi từ bỏ
+        for (int i = 0; i < 5; i++) {
+            sleep(1);
+            write_fd = open(BROWSER_FIFO, O_WRONLY | O_NONBLOCK);
+            if (write_fd >= 0) {
+                printf("Đã kết nối tới browser qua FIFO!\n");
+                break;
+            }
+        }
+        
+        if (write_fd < 0) {
+            printf("Không thể kết nối tới browser qua FIFO, sẽ thử message queue\n");
+        }
     }
 
     // Khởi tạo message queue cho tab
     key_t tab_key = get_tab_queue_key(tab_id);
     tab_queue_id = create_message_queue(tab_key);
     if (tab_queue_id < 0) {
-        fprintf(stderr, "Failed to create tab message queue\n");
-        // Không thoát, sẽ thử FIFO
+        fprintf(stderr, "Warning: Failed to create tab message queue, continuing with reduced functionality\n");
     } else {
         printf("[Tab %d] Message queue created with ID: %d\n", tab_id, tab_queue_id);
     }
@@ -287,7 +305,17 @@ int main(int argc, char *argv[]) {
     browser_queue_id = msgget(BROWSER_QUEUE_KEY, 0);
     if (browser_queue_id < 0) {
         perror("msgget browser queue");
-        // Không thoát, sẽ thử FIFO
+        printf("Chờ kết nối tới browser message queue...\n");
+        
+        // Thử lại vài lần
+        for (int i = 0; i < 5; i++) {
+            sleep(1);
+            browser_queue_id = msgget(BROWSER_QUEUE_KEY, 0);
+            if (browser_queue_id >= 0) {
+                printf("Đã kết nối tới browser message queue!\n");
+                break;
+            }
+        }
     } else {
         printf("[Tab %d] Connected to browser message queue with ID: %d\n", tab_id, browser_queue_id);
     }
@@ -296,19 +324,47 @@ int main(int argc, char *argv[]) {
     semid = semget(SEM_KEY, 0, 0);
     if (semid < 0) {
         perror("semget");
-        // Không thoát, sẽ tiếp tục nhưng không dùng semaphore
+        printf("Warning: Semaphores not available, continuing without synchronization\n");
     } else {
         printf("[Tab %d] Connected to semaphore set with ID: %d\n", tab_id, semid);
     }
 
     // Kết nối vào shared memory
-    shm_pointer = shmat(shmget(SHM_KEY, 0, 0), NULL, 0);
-    if (shm_pointer == (void *)-1) {
-        perror("shmat");
-        // Không thoát, sẽ tiếp tục nhưng không dùng shared memory
+    int shmid = shmget(SHM_KEY, 0, 0);
+    if (shmid < 0) {
+        perror("shmget");
+        printf("Chờ kết nối tới shared memory...\n");
+        
+        // Thử lại vài lần
+        for (int i = 0; i < 5; i++) {
+            sleep(1);
+            shmid = shmget(SHM_KEY, 0, 0);
+            if (shmid >= 0) {
+                break;
+            }
+        }
+    }
+    
+    if (shmid >= 0) {
+        shm_pointer = shmat(shmid, NULL, 0);
+        if (shm_pointer == (void *)-1) {
+            perror("shmat");
+            printf("Warning: Failed to attach shared memory, continuing with reduced functionality\n");
+        } else {
+            shared_mem = (SharedMemorySegment *)shm_pointer;
+            printf("[Tab %d] Connected to shared memory\n", tab_id);
+        }
     } else {
-        shared_mem = (SharedMemorySegment *)shm_pointer;
-        printf("[Tab %d] Connected to shared memory\n", tab_id);
+        printf("Warning: Shared memory not available\n");
+    }
+
+    // Kiểm tra nếu cả hai phương thức kết nối đều thất bại
+    if (write_fd < 0 && browser_queue_id < 0) {
+        printf("CẢNH BÁO: Không thể kết nối đến Browser qua bất kỳ phương thức nào.\n");
+        printf("Hãy đảm bảo Browser đang chạy trước khi khởi động Tab.\n");
+        
+        // Vẫn tiếp tục để hiển thị giao diện, nhưng sẽ không thực hiện được các lệnh
+        printf("Tiếp tục với UI offline...\n");
     }
 
     BrowserMessage msg;
@@ -325,7 +381,16 @@ int main(int argc, char *argv[]) {
     mainwin = newwin(height, width, starty, startx);
     box(mainwin, 0, 0);
     mvwprintw(mainwin, 1, 2, "Mini Browser - Tab %d", tab_id);
-    mvwprintw(mainwin, 2, 2, "Using: %s", (browser_queue_id >= 0) ? "Message Queue" : "Legacy FIFO");
+    
+    // Hiển thị thông tin kết nối
+    if (browser_queue_id >= 0) {
+        mvwprintw(mainwin, 2, 2, "Using: Message Queue");
+    } else if (write_fd >= 0) {
+        mvwprintw(mainwin, 2, 2, "Using: Legacy FIFO");
+    } else {
+        mvwprintw(mainwin, 2, 2, "WARNING: No connection to Browser!");
+    }
+    
     mvwprintw(mainwin, 11, 2, "Command > ");
     wrefresh(mainwin);
     move(11, 13);
