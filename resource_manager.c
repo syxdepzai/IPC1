@@ -8,6 +8,8 @@
 #include <time.h>
 #include "common.h"
 #include "shared_memory.h"
+#include "message_queue.h"
+#include "semaphore.h"
 
 #define MAX_CACHE_ENTRIES 10
 #define CACHE_DIR "/tmp/browser_cache/"
@@ -25,6 +27,14 @@ CacheEntry cache[MAX_CACHE_ENTRIES];
 SharedMemorySegment *shared_mem = NULL;
 void *shm_pointer = NULL;
 int shmid = -1;
+
+// Biến toàn cục cho message queue
+int resource_queue_id = -1;
+int *tab_queue_ids = NULL;
+int max_tabs = 10;
+
+// Biến toàn cục cho semaphore
+int semid = -1;
 
 // Khởi tạo hệ thống cache
 void init_cache() {
@@ -131,19 +141,99 @@ int read_from_cache(int cache_index, char *content, int *content_size, int max_s
     return 0;
 }
 
+// Gửi phản hồi đến tab
+void send_response_to_tab(BrowserMessage *response) {
+    int tab_id = response->tab_id;
+    
+    // Kiểm tra xem tab_queue_ids đã được khởi tạo chưa
+    if (tab_queue_ids == NULL) {
+        tab_queue_ids = (int *)malloc(sizeof(int) * max_tabs);
+        if (tab_queue_ids == NULL) {
+            fprintf(stderr, "Failed to allocate memory for tab queue IDs\n");
+            return;
+        }
+        
+        for (int i = 0; i < max_tabs; i++) {
+            tab_queue_ids[i] = -1;
+        }
+    }
+    
+    // Tìm hoặc tạo message queue cho tab
+    if (tab_id >= max_tabs || tab_queue_ids[tab_id] < 0) {
+        key_t key = get_tab_queue_key(tab_id);
+        tab_queue_ids[tab_id] = msgget(key, 0);
+        if (tab_queue_ids[tab_id] < 0) {
+            fprintf(stderr, "Failed to find message queue for Tab %d\n", tab_id);
+            
+            // Thử gửi thông qua FIFO (legacy)
+            char response_fifo[64];
+            snprintf(response_fifo, sizeof(response_fifo), "%s%d", RESPONSE_FIFO_PREFIX, tab_id);
+            int fd = open(response_fifo, O_WRONLY);
+            if (fd >= 0) {
+                write(fd, response, sizeof(BrowserMessage));
+                close(fd);
+                printf("[Resource Manager] Sent response to Tab %d via legacy FIFO\n", tab_id);
+            } else {
+                perror("open response fifo");
+            }
+            return;
+        }
+    }
+    
+    // Tạo message để gửi
+    MessageQueueData msg_data;
+    msg_data.mtype = 1; // Loại mặc định
+    memcpy(&msg_data.message, response, sizeof(BrowserMessage));
+    
+    // Gửi message
+    if (send_message(tab_queue_ids[tab_id], &msg_data, sizeof(BrowserMessage)) < 0) {
+        fprintf(stderr, "Failed to send message to Tab %d\n", tab_id);
+        
+        // Thử gửi thông qua FIFO (legacy)
+        char response_fifo[64];
+        snprintf(response_fifo, sizeof(response_fifo), "%s%d", RESPONSE_FIFO_PREFIX, tab_id);
+        int fd = open(response_fifo, O_WRONLY);
+        if (fd >= 0) {
+            write(fd, response, sizeof(BrowserMessage));
+            close(fd);
+            printf("[Resource Manager] Sent response to Tab %d via legacy FIFO\n", tab_id);
+        } else {
+            perror("open response fifo");
+        }
+    } else {
+        printf("[Resource Manager] Sent response to Tab %d via message queue\n", tab_id);
+    }
+}
+
 // Xử lý tín hiệu để dọn dẹp
 void signal_handler(int sig) {
     printf("[Resource Manager] Received signal %d, cleaning up...\n", sig);
+    
+    // Hủy shared memory
     if (shm_pointer != NULL) {
         destroy_shared_memory(shm_pointer, shmid);
     }
+    
+    // Hủy FIFO
     unlink(RESOURCE_FIFO);
+    
+    // Hủy message queue
+    if (resource_queue_id >= 0) {
+        destroy_message_queue(resource_queue_id);
+    }
+    
+    // Hủy tab queue IDs
+    if (tab_queue_ids) {
+        free(tab_queue_ids);
+    }
+    
     exit(0);
 }
 
 int main() {
     int fd;
     BrowserMessage msg, response;
+    MessageQueueData msg_data;
     
     // Đăng ký handler xử lý tín hiệu
     signal(SIGINT, signal_handler);
@@ -152,9 +242,25 @@ int main() {
     // Khởi tạo cache
     init_cache();
     
-    // Tạo FIFO cho resource manager
+    // Tạo FIFO cho resource manager (legacy, để tương thích ngược)
     mkfifo(RESOURCE_FIFO, 0666);
-    printf("[Resource Manager] Started. Listening on %s...\n", RESOURCE_FIFO);
+    printf("[Resource Manager] Legacy FIFO created at %s...\n", RESOURCE_FIFO);
+    
+    // Khởi tạo message queue
+    resource_queue_id = create_message_queue(RESOURCE_QUEUE_KEY);
+    if (resource_queue_id < 0) {
+        fprintf(stderr, "Failed to create resource message queue\n");
+        return 1;
+    }
+    
+    // Kết nối vào semaphore set
+    semid = semget(SEM_KEY, 0, 0);
+    if (semid < 0) {
+        perror("semget");
+        // Vẫn tiếp tục, nhưng không sử dụng semaphore
+    } else {
+        printf("[Resource Manager] Connected to semaphore set with ID: %d\n", semid);
+    }
     
     // Kết nối vào shared memory
     shm_pointer = create_shared_memory();
@@ -164,74 +270,150 @@ int main() {
     }
     shared_mem = (SharedMemorySegment *)shm_pointer;
     
+    printf("[Resource Manager] Started. Message queue ID: %d\n", resource_queue_id);
+    
+    // Khởi tạo tab_queue_ids
+    tab_queue_ids = (int *)malloc(sizeof(int) * max_tabs);
+    if (tab_queue_ids == NULL) {
+        fprintf(stderr, "Failed to allocate memory for tab queue IDs\n");
+        signal_handler(SIGTERM);
+        return 1;
+    }
+    
+    for (int i = 0; i < max_tabs; i++) {
+        tab_queue_ids[i] = -1;
+    }
+    
     while (1) {
-        // Mở FIFO để đọc
-        fd = open(RESOURCE_FIFO, O_RDONLY);
-        if (fd < 0) {
-            perror("open resource fifo");
-            continue;
+        int received = 0;
+        
+        // Kiểm tra FIFO để tương thích ngược
+        fd = open(RESOURCE_FIFO, O_RDONLY | O_NONBLOCK);
+        if (fd >= 0) {
+            while (read(fd, &msg, sizeof(msg)) > 0) {
+                printf("[Resource Manager] Legacy FIFO: Received message type %d from tab %d\n", 
+                       msg.type, msg.tab_id);
+                
+                // Xử lý thông điệp
+                if (semid >= 0) {
+                    lock_semaphore(semid, SEM_RESOURCE);
+                }
+                
+                // Xử lý các loại thông điệp
+                if (msg.type == MSG_CACHE_REQUEST) {
+                    process_cache_request(&msg, &response);
+                    send_response_to_tab(&response);
+                } else if (msg.type == MSG_LOAD_PAGE) {
+                    process_load_page(&msg);
+                }
+                
+                if (semid >= 0) {
+                    unlock_semaphore(semid, SEM_RESOURCE);
+                }
+                
+                received = 1;
+            }
+            close(fd);
         }
         
-        // Đọc thông điệp
-        while (read(fd, &msg, sizeof(msg)) > 0) {
-            printf("[Resource Manager] Received message type %d from tab %d\n", msg.type, msg.tab_id);
+        // Đọc từ message queue
+        if (receive_message(resource_queue_id, &msg_data, 0, sizeof(BrowserMessage)) > 0) {
+            memcpy(&msg, &msg_data.message, sizeof(BrowserMessage));
+            printf("[Resource Manager] Message Queue: Received message type %d from tab %d\n", 
+                   msg.type, msg.tab_id);
+                   
+            // Xử lý thông điệp
+            if (semid >= 0) {
+                lock_semaphore(semid, SEM_RESOURCE);
+            }
             
             // Xử lý các loại thông điệp
             if (msg.type == MSG_CACHE_REQUEST) {
-                // Tìm trong cache
-                char url[256];
-                strncpy(url, msg.command, sizeof(url));
-                int cache_index = find_in_cache(url);
-                
-                response.tab_id = msg.tab_id;
-                response.type = MSG_CACHE_RESPONSE;
-                response.has_shared_data = 0;
-                
-                if (cache_index >= 0) {
-                    // Tìm thấy trong cache
-                    char cache_content[MAX_HTML_SIZE];
-                    int content_size;
-                    
-                    if (read_from_cache(cache_index, cache_content, &content_size, MAX_HTML_SIZE) == 0) {
-                        // Lưu vào shared memory
-                        if (store_data_in_shared_memory(shared_mem, msg.tab_id, url, cache_content, content_size) == 0) {
-                            response.has_shared_data = 1;
-                            strcpy(response.command, "CACHE_HIT");
-                        } else {
-                            strcpy(response.command, "ERROR: Failed to store in shared memory");
-                        }
-                    } else {
-                        strcpy(response.command, "ERROR: Failed to read from cache");
-                    }
-                } else {
-                    // Không tìm thấy trong cache
-                    strcpy(response.command, "CACHE_MISS");
-                }
-                
-                // Gửi phản hồi
-                char response_fifo[64];
-                snprintf(response_fifo, sizeof(response_fifo), "%s%d", RESPONSE_FIFO_PREFIX, msg.tab_id);
-                int resp_fd = open(response_fifo, O_WRONLY);
-                if (resp_fd >= 0) {
-                    write(resp_fd, &response, sizeof(response));
-                    close(resp_fd);
-                }
+                process_cache_request(&msg, &response);
+                send_response_to_tab(&response);
             } else if (msg.type == MSG_LOAD_PAGE) {
-                // Trang đã được tải, lưu vào cache
-                if (msg.has_shared_data) {
-                    char content[MAX_HTML_SIZE];
-                    int content_size;
-                    
-                    if (read_data_from_shared_memory(shared_mem, msg.tab_id, content, &content_size) == 0) {
-                        // Thêm vào cache
-                        add_to_cache(msg.command, content, content_size);
-                    }
-                }
+                process_load_page(&msg);
             }
+            
+            if (semid >= 0) {
+                unlock_semaphore(semid, SEM_RESOURCE);
+            }
+            
+            received = 1;
         }
         
-        close(fd);
+        // Nếu không có message nào, sleep một chút để giảm CPU usage
+        if (!received) {
+            usleep(10000); // 10ms
+        }
     }
     
     return 0;
+}
+
+// Xử lý yêu cầu cache
+void process_cache_request(BrowserMessage *msg, BrowserMessage *response) {
+    // Tìm trong cache
+    char url[256];
+    strncpy(url, msg->command, sizeof(url));
+    int cache_index = find_in_cache(url);
+    
+    response->tab_id = msg->tab_id;
+    response->type = MSG_CACHE_RESPONSE;
+    response->has_shared_data = 0;
+    
+    if (cache_index >= 0) {
+        // Tìm thấy trong cache
+        char cache_content[MAX_HTML_SIZE];
+        int content_size;
+        
+        if (read_from_cache(cache_index, cache_content, &content_size, MAX_HTML_SIZE) == 0) {
+            // Lock semaphore trước khi truy cập shared memory
+            if (semid >= 0) {
+                lock_semaphore(semid, SEM_SHARED_MEM);
+            }
+            
+            // Lưu vào shared memory
+            if (store_data_in_shared_memory(shared_mem, msg->tab_id, url, cache_content, content_size) == 0) {
+                response->has_shared_data = 1;
+                strcpy(response->command, "CACHE_HIT");
+            } else {
+                strcpy(response->command, "ERROR: Failed to store in shared memory");
+            }
+            
+            // Unlock shared memory
+            if (semid >= 0) {
+                unlock_semaphore(semid, SEM_SHARED_MEM);
+            }
+        } else {
+            strcpy(response->command, "ERROR: Failed to read from cache");
+        }
+    } else {
+        // Không tìm thấy trong cache
+        strcpy(response->command, "CACHE_MISS");
+    }
+}
+
+// Xử lý trang đã được tải
+void process_load_page(BrowserMessage *msg) {
+    // Trang đã được tải, lưu vào cache
+    if (msg->has_shared_data) {
+        // Lock semaphore trước khi đọc shared memory
+        if (semid >= 0) {
+            lock_semaphore(semid, SEM_SHARED_MEM);
+        }
+        
+        char content[MAX_HTML_SIZE];
+        int content_size;
+        
+        if (read_data_from_shared_memory(shared_mem, msg->tab_id, content, &content_size) == 0) {
+            // Thêm vào cache
+            add_to_cache(msg->command, content, content_size);
+        }
+        
+        // Unlock shared memory
+        if (semid >= 0) {
+            unlock_semaphore(semid, SEM_SHARED_MEM);
+        }
+    }
 } 

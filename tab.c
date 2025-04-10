@@ -9,6 +9,8 @@
 #include <signal.h>
 #include "common.h"
 #include "shared_memory.h"
+#include "message_queue.h"
+#include "semaphore.h"
 
 int tab_id;
 int write_fd;
@@ -20,6 +22,13 @@ pthread_mutex_t display_mutex = PTHREAD_MUTEX_INITIALIZER;
 SharedMemorySegment *shared_mem = NULL;
 void *shm_pointer = NULL;
 int shmid = -1;
+
+// Message queue
+int browser_queue_id = -1;
+int tab_queue_id = -1;
+
+// Semaphore
+int semid = -1;
 
 // Cấu trúc lưu lịch sử duyệt web
 #define MAX_HISTORY 10
@@ -75,10 +84,20 @@ const char *go_forward() {
 void signal_handler(int sig) {
     printf("Tab %d received signal %d, cleaning up...\n", tab_id, sig);
     endwin();
+    
+    // Ngắt kết nối shared memory
     if (shm_pointer != NULL) {
         shmdt(shm_pointer);
     }
+    
+    // Hủy legacy FIFO
     unlink(response_fifo);
+    
+    // Hủy message queue của tab
+    if (tab_queue_id >= 0) {
+        destroy_message_queue(tab_queue_id);
+    }
+    
     exit(0);
 }
 
@@ -121,28 +140,92 @@ void update_display(const char *content, int is_error) {
     pthread_mutex_unlock(&display_mutex);
 }
 
+// Gửi thông điệp đến browser thông qua message queue
+void send_to_browser(BrowserMessage *msg) {
+    MessageQueueData msg_data;
+    msg_data.mtype = 1; // Loại mặc định
+    memcpy(&msg_data.message, msg, sizeof(BrowserMessage));
+    
+    // Thử gửi qua message queue
+    if (browser_queue_id >= 0) {
+        if (send_message(browser_queue_id, &msg_data, sizeof(BrowserMessage)) >= 0) {
+            printf("[Tab %d] Sent message to browser via message queue\n", tab_id);
+            return;
+        }
+        // Nếu gửi thất bại, thử gửi qua FIFO
+    }
+    
+    // Sử dụng legacy FIFO nếu message queue không hoạt động
+    if (write_fd >= 0) {
+        if (write(write_fd, msg, sizeof(BrowserMessage)) >= 0) {
+            printf("[Tab %d] Sent message to browser via legacy FIFO\n", tab_id);
+        } else {
+            perror("write to browser fifo");
+        }
+    } else {
+        fprintf(stderr, "[Tab %d] Failed to send message to browser\n", tab_id);
+    }
+}
+
 // Thread lắng nghe phản hồi
 void *listen_response(void *arg) {
-    int read_fd = open(response_fifo, O_RDONLY);
-    if (read_fd < 0) {
-        perror("open response fifo");
-        pthread_exit(NULL);
-    }
-
+    MessageQueueData msg_data;
     BrowserMessage response;
+    int legacy_fd = -1;
+    
     while (1) {
-        int bytes = read(read_fd, &response, sizeof(response));
-        if (bytes > 0) {
+        int received = 0;
+        
+        // Thử nhận từ message queue
+        if (tab_queue_id >= 0) {
+            if (receive_message(tab_queue_id, &msg_data, 0, sizeof(BrowserMessage)) > 0) {
+                memcpy(&response, &msg_data.message, sizeof(BrowserMessage));
+                received = 1;
+                printf("[Tab %d] Received response via message queue\n", tab_id);
+            }
+        }
+        
+        // Nếu không nhận được từ message queue, thử FIFO
+        if (!received) {
+            if (legacy_fd < 0) {
+                legacy_fd = open(response_fifo, O_RDONLY | O_NONBLOCK);
+            }
+            
+            if (legacy_fd >= 0) {
+                int bytes = read(legacy_fd, &response, sizeof(response));
+                if (bytes > 0) {
+                    received = 1;
+                    printf("[Tab %d] Received response via legacy FIFO\n", tab_id);
+                } else if (bytes < 0 && errno != EAGAIN) {
+                    close(legacy_fd);
+                    legacy_fd = -1;
+                }
+            }
+        }
+        
+        if (received) {
             printf("[Tab %d] Received response type %d\n", tab_id, response.type);
             
             int is_error = (response.type == MSG_ERROR);
             
             if (response.has_shared_data) {
+                // Lock semaphore trước khi đọc shared memory
+                if (semid >= 0) {
+                    lock_semaphore(semid, SEM_SHARED_MEM);
+                }
+                
                 // Đọc dữ liệu từ shared memory
                 char content[MAX_HTML_SIZE];
                 int content_size;
                 
-                if (read_data_from_shared_memory(shared_mem, tab_id, content, &content_size) == 0) {
+                int result = read_data_from_shared_memory(shared_mem, tab_id, content, &content_size);
+                
+                // Unlock semaphore sau khi đọc xong
+                if (semid >= 0) {
+                    unlock_semaphore(semid, SEM_SHARED_MEM);
+                }
+                
+                if (result == 0) {
                     // Hiển thị nội dung từ shared memory
                     update_display(content, is_error);
                 } else {
@@ -158,9 +241,14 @@ void *listen_response(void *arg) {
                 }
             }
         }
+        
+        // Sleep một chút để tránh tiêu tốn CPU
+        usleep(10000); // 10ms
     }
 
-    close(read_fd);
+    if (legacy_fd >= 0) {
+        close(legacy_fd);
+    }
     return NULL;
 }
 
@@ -178,21 +266,50 @@ int main(int argc, char *argv[]) {
     snprintf(response_fifo, sizeof(response_fifo), "%s%d", RESPONSE_FIFO_PREFIX, tab_id);
     mkfifo(response_fifo, 0666);
 
-    // Kết nối vào browser
+    // Kết nối vào browser (FIFO legacy)
     write_fd = open(BROWSER_FIFO, O_WRONLY);
     if (write_fd < 0) {
         perror("open browser fifo");
-        exit(1);
+        // Không thoát, sẽ thử message queue
+    }
+
+    // Khởi tạo message queue cho tab
+    key_t tab_key = get_tab_queue_key(tab_id);
+    tab_queue_id = create_message_queue(tab_key);
+    if (tab_queue_id < 0) {
+        fprintf(stderr, "Failed to create tab message queue\n");
+        // Không thoát, sẽ thử FIFO
+    } else {
+        printf("[Tab %d] Message queue created with ID: %d\n", tab_id, tab_queue_id);
+    }
+    
+    // Kết nối vào message queue của browser
+    browser_queue_id = msgget(BROWSER_QUEUE_KEY, 0);
+    if (browser_queue_id < 0) {
+        perror("msgget browser queue");
+        // Không thoát, sẽ thử FIFO
+    } else {
+        printf("[Tab %d] Connected to browser message queue with ID: %d\n", tab_id, browser_queue_id);
+    }
+    
+    // Kết nối vào semaphore set
+    semid = semget(SEM_KEY, 0, 0);
+    if (semid < 0) {
+        perror("semget");
+        // Không thoát, sẽ tiếp tục nhưng không dùng semaphore
+    } else {
+        printf("[Tab %d] Connected to semaphore set with ID: %d\n", tab_id, semid);
     }
 
     // Kết nối vào shared memory
     shm_pointer = shmat(shmget(SHM_KEY, 0, 0), NULL, 0);
     if (shm_pointer == (void *)-1) {
         perror("shmat");
-        close(write_fd);
-        exit(1);
+        // Không thoát, sẽ tiếp tục nhưng không dùng shared memory
+    } else {
+        shared_mem = (SharedMemorySegment *)shm_pointer;
+        printf("[Tab %d] Connected to shared memory\n", tab_id);
     }
-    shared_mem = (SharedMemorySegment *)shm_pointer;
 
     BrowserMessage msg;
     msg.tab_id = tab_id;
@@ -208,6 +325,7 @@ int main(int argc, char *argv[]) {
     mainwin = newwin(height, width, starty, startx);
     box(mainwin, 0, 0);
     mvwprintw(mainwin, 1, 2, "Mini Browser - Tab %d", tab_id);
+    mvwprintw(mainwin, 2, 2, "Using: %s", (browser_queue_id >= 0) ? "Message Queue" : "Legacy FIFO");
     mvwprintw(mainwin, 11, 2, "Command > ");
     wrefresh(mainwin);
     move(11, 13);
@@ -264,7 +382,7 @@ int main(int argc, char *argv[]) {
         }
         
         msg.has_shared_data = 0; // Tab không gửi dữ liệu qua shared memory
-        write(write_fd, &msg, sizeof(msg));
+        send_to_browser(&msg);
 
         mvwprintw(mainwin, 11, 13, "%*s", MAX_MSG, "");
         move(11, 13);
@@ -272,10 +390,20 @@ int main(int argc, char *argv[]) {
     }
 
     endwin();
-    close(write_fd);
+    
+    // Đóng các kết nối
+    if (write_fd >= 0) {
+        close(write_fd);
+    }
+    
     if (shm_pointer != NULL) {
         shmdt(shm_pointer);
     }
+    
+    if (tab_queue_id >= 0) {
+        destroy_message_queue(tab_queue_id);
+    }
+    
     unlink(response_fifo);
     return 0;
 }
