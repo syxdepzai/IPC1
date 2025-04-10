@@ -11,6 +11,9 @@
 #include "shared_memory.h"
 #include "message_queue.h"
 #include "semaphore.h"
+#include "tab.h"
+#include "browser.h"
+#include "html_parser.h"
 
 int tab_id;
 int write_fd;
@@ -39,6 +42,9 @@ typedef struct {
 } BrowsingHistory;
 
 BrowsingHistory history = {{{0}}, -1, 0};
+
+// Khai báo thêm
+ParsedHtml current_page;
 
 // Thêm URL vào lịch sử
 void add_to_history(const char *url) {
@@ -230,19 +236,22 @@ void *listen_response(void *arg) {
                 }
                 
                 if (result == 0) {
-                    // Hiển thị nội dung từ shared memory
-                    update_display(content, is_error);
+                    // Kiểm tra nếu là phản hồi của lệnh LOAD_PAGE
+                    if (response.type == MSG_PAGE_LOADED) {
+                        // Xử lý nội dung HTML nhận được
+                        char url[MAX_URL_LEN];
+                        sscanf(response.command, "load %s", url);
+                        process_load_page(url, content);
+                    } else {
+                        // Hiển thị nội dung từ shared memory
+                        update_display(content, is_error);
+                    }
                 } else {
                     update_display("Error: Failed to read from shared memory", 1);
                 }
             } else {
                 // Hiển thị thông báo từ command
                 update_display(response.command, is_error);
-                
-                // Xử lý các loại phản hồi đặc biệt
-                if (response.type == MSG_PAGE_LOADED) {
-                    // Chỉ cần đợi phản hồi từ renderer
-                }
             }
         }
         
@@ -254,6 +263,149 @@ void *listen_response(void *arg) {
         close(legacy_fd);
     }
     return NULL;
+}
+
+// Trong hàm process_load_page, thêm xử lý HTML sau khi nhận nội dung từ resource manager
+void process_load_page(const char* url, const char* page_content) {
+    // Thêm URL vào lịch sử
+    add_to_history(url);
+    
+    // Phân tích nội dung HTML
+    if (parse_html(page_content, &current_page)) {
+        // Chuẩn bị thông tin để hiển thị
+        char display_content[MAX_MSG];
+        snprintf(display_content, MAX_MSG,
+                "Tiêu đề: %s\n"
+                "Số liên kết: %d\n\n"
+                "%s\n\n"
+                "Dùng 'link <số>' để mở liên kết theo số thứ tự.",
+                current_page.title,
+                current_page.num_links,
+                current_page.formatted_content);
+        
+        // Hiển thị nội dung
+        update_display(display_content, 0);
+        
+        // Hiển thị danh sách liên kết nếu có
+        if (current_page.num_links > 0) {
+            char links_info[MAX_MSG];
+            int offset = 0;
+            offset += snprintf(links_info + offset, MAX_MSG - offset, "\nDanh sách liên kết:\n");
+            
+            for (int i = 0; i < current_page.num_links && i < 10; i++) { // Giới hạn hiển thị 10 liên kết
+                offset += snprintf(links_info + offset, MAX_MSG - offset, 
+                                "%d. %s\n", i + 1, current_page.links[i]);
+            }
+            
+            if (current_page.num_links > 10) {
+                offset += snprintf(links_info + offset, MAX_MSG - offset, "... và %d liên kết khác\n", 
+                                current_page.num_links - 10);
+            }
+            
+            // Hiển thị bổ sung thông tin về liên kết
+            pthread_mutex_lock(&display_mutex);
+            mvwprintw(mainwin, 12, 2, "%s", links_info);
+            wrefresh(mainwin);
+            pthread_mutex_unlock(&display_mutex);
+        }
+    } else {
+        // Hiển thị nội dung thô nếu không phân tích được HTML
+        update_display(page_content, 0);
+    }
+}
+
+// Thêm hàm để mở liên kết bằng số thứ tự
+void open_link_by_number(int link_number) {
+    if (link_number <= 0 || link_number > current_page.num_links) {
+        update_display("Số liên kết không hợp lệ!", 1);
+        return;
+    }
+    
+    // Lấy URL từ danh sách liên kết
+    const char* link_url = get_link_by_index(&current_page, link_number - 1);
+    if (link_url && *link_url) {
+        char full_url[MAX_URL_LEN];
+        
+        // Giải quyết URL tương đối nếu cần
+        if (!is_absolute_url(link_url)) {
+            // Lấy URL hiện tại từ lịch sử
+            const char* current_url = history.urls[history.current];
+            resolve_relative_url(current_url, link_url, full_url, MAX_URL_LEN);
+        } else {
+            strncpy(full_url, link_url, MAX_URL_LEN - 1);
+            full_url[MAX_URL_LEN - 1] = '\0';
+        }
+        
+        // Tạo tin nhắn "load" và gửi đi
+        char command[MAX_URL_LEN + 10]; // "load " + url
+        snprintf(command, sizeof(command), "load %s", full_url);
+        
+        BrowserMessage msg;
+        msg.tab_id = tab_id;
+        msg.type = MSG_LOAD_PAGE;
+        msg.has_shared_data = 0;
+        strncpy(msg.command, command, MAX_MSG);
+        
+        send_to_browser(&msg);
+    } else {
+        update_display("Liên kết không hợp lệ!", 1);
+    }
+}
+
+// Sửa đổi hàm process_command để hỗ trợ lệnh "link <số>"
+void process_command(const char* command) {
+    if (strncmp(command, "link ", 5) == 0) {
+        int link_number = atoi(command + 5);
+        open_link_by_number(link_number);
+        return;
+    }
+    
+    BrowserMessage msg;
+    msg.tab_id = tab_id;
+    msg.has_shared_data = 0;
+    
+    // Xử lý các lệnh đặc biệt
+    if (strcmp(command, "back") == 0) {
+        // Quay lại trang trước
+        const char *prev_url = go_back();
+        if (prev_url) {
+            // Gửi lệnh load trang trước
+            char load_cmd[MAX_MSG];
+            snprintf(load_cmd, sizeof(load_cmd), "load %s", prev_url);
+            strncpy(msg.command, load_cmd, MAX_MSG);
+        } else {
+            strncpy(msg.command, "back", MAX_MSG);
+        }
+        msg.type = MSG_BACK;
+    }
+    else if (strcmp(command, "forward") == 0) {
+        // Đi đến trang tiếp theo
+        const char *next_url = go_forward();
+        if (next_url) {
+            // Gửi lệnh load trang tiếp theo
+            char load_cmd[MAX_MSG];
+            snprintf(load_cmd, sizeof(load_cmd), "load %s", next_url);
+            strncpy(msg.command, load_cmd, MAX_MSG);
+        } else {
+            strncpy(msg.command, "forward", MAX_MSG);
+        }
+        msg.type = MSG_FORWARD;
+    }
+    else if (strncmp(command, "load ", 5) == 0) {
+        // Tải trang mới, thêm vào lịch sử
+        strncpy(msg.command, command, MAX_MSG);
+        msg.type = MSG_LOAD_PAGE;
+    }
+    else if (strcmp(command, "reload") == 0) {
+        strncpy(msg.command, command, MAX_MSG);
+        msg.type = MSG_RELOAD;
+    }
+    else {
+        strncpy(msg.command, command, MAX_MSG);
+        msg.type = MSG_ERROR; // Default type
+    }
+    
+    send_to_browser(&msg);
 }
 
 int main(int argc, char *argv[]) {
