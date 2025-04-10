@@ -22,6 +22,10 @@ typedef struct {
     int is_valid;
 } CacheEntry;
 
+// Khai báo prototype của các hàm
+void process_cache_request(BrowserMessage *msg, BrowserMessage *response);
+void process_load_page(BrowserMessage *msg);
+
 // Biến toàn cục
 CacheEntry cache[MAX_CACHE_ENTRIES];
 SharedMemorySegment *shared_mem = NULL;
